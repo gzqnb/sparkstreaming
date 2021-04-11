@@ -21,11 +21,11 @@ object MyESUtil {
   //声明Jest客户端工厂
   private var jestFactory: JestClientFactory = _
 
-  def bulkInsert(dauInfoList: List[(String,DauInfo)], indexName: String): Unit = {
-    if (dauInfoList != null && dauInfoList.size > 0) {
+  def bulkInsert(infoList: List[(String,Any)], indexName: String): Unit = {
+    if (infoList != null && infoList.size > 0) {
       val jestClient = getJestClient
       val bulk: Bulk.Builder = new Bulk.Builder()
-      for ((id,elem) <- dauInfoList) {
+      for ((id,elem) <- infoList) {
         val index = new Index.Builder(elem)
           .index(indexName)
           .`type`("_doc")
