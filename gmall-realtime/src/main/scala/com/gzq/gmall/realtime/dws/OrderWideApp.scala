@@ -1,13 +1,16 @@
 package com.gzq.gmall.realtime.dws
 
 import java.lang
+import java.util.Properties
 
 import com.alibaba.fastjson.JSON
 import com.gzq.gmall.realtime.bean.{OrderDetail, OrderInfo, OrderWide}
 import com.gzq.gmall.realtime.util.{MyKafkaUtil, MyRedisUtil, OffsetManagerUtil}
 import org.apache.kafka.clients.consumer.ConsumerRecord
 import org.apache.kafka.common.TopicPartition
+import org.apache.spark
 import org.apache.spark.SparkConf
+import org.apache.spark.sql.{DataFrame, SaveMode, SparkSession}
 import org.apache.spark.streaming.dstream.{DStream, InputDStream}
 import org.apache.spark.streaming.kafka010.{HasOffsetRanges, OffsetRange}
 import org.apache.spark.streaming.{Seconds, StreamingContext}
@@ -137,7 +140,65 @@ object OrderWideApp {
         orderWideList.toIterator
       }
     }
-    orderWideDStream.print(1000)
+    //    orderWideDStream.print(1000)
+
+    val orderWideSplitDStream: DStream[OrderWide] = orderWideDStream.mapPartitions {
+      orderWideItr => {
+        val orderWideList: List[OrderWide] = orderWideItr.toList
+        val jedis: Jedis = MyRedisUtil.getJedisClient
+        for (orderWide <- orderWideList) {
+          var orderOriginSumKey = "order_origin_sum:" + orderWide.order_id
+          var orderOriginSum: Double = 0D
+          val orderOriginSumStr: String = jedis.get(orderOriginSumKey)
+          if (orderOriginSumStr != null && orderOriginSumStr.size > 0) {
+            orderOriginSum = orderOriginSumStr.toDouble
+          }
+
+          var orderSplitSumKey = "order_split_sum:" + orderWide.order_id
+          var orderSplitSum: Double = 0D
+          val orderSplitSumStr: String = jedis.get(orderSplitSumKey)
+          if (orderOriginSumStr != null && orderOriginSumStr.size > 0) {
+            orderOriginSum = orderSplitSumStr.toDouble
+          }
+          val detailAmount: Double = orderWide.sku_price * orderWide.sku_num
+          if (detailAmount == orderWide.original_total_amount - orderOriginSum) {
+            orderWide.final_detail_amount = Math.round((orderWide.final_total_amount - orderSplitSum) * 100d) / 100d
+          } else {
+            orderWide.final_detail_amount = Math.round((orderWide.final_total_amount * detailAmount / orderWide.original_total_amount) * 100d) / 100d
+          }
+
+
+          //更新redis中的值
+          var newOrderOriginSum = orderOriginSum + detailAmount
+          jedis.setex(orderOriginSumKey, 600, newOrderOriginSum.toString)
+
+          var newOrderSplitSum = orderSplitSum + orderWide.final_detail_amount
+          jedis.setex(orderSplitSumKey, 600, newOrderSplitSum.toString)
+
+        }
+        jedis.close()
+        orderWideList.toIterator
+      }
+    }
+    //    orderWideSplitDStream.print(1000)
+    val aa: SparkSession = SparkSession.builder().appName("spark_sql_orderWide").getOrCreate()
+
+    import aa.implicits._
+
+    orderWideDStream.foreachRDD {
+      rdd => {
+        val df: DataFrame = rdd.toDF
+        df.write.mode(SaveMode.Append)
+          .option("batchsize", "100")
+          .option("isolationLevel", "NONE") // 设置事务
+          .option("numPartitions", "4") // 设置并发
+          .option("driver", "ru.yandex.clickhouse.ClickHouseDriver")
+          .jdbc("jdbc:clickhouse://192.168.56.10:8123/default", "t_order_wide_2020", new Properties())
+        OffsetManagerUtil.saveOffset(orderInfoTopic,orderInfoGroupId,orderInfoOffsetRanges)
+        OffsetManagerUtil.saveOffset(orderDetailTopic,orderDetailGroupId,orderDetailOffsetRanges)
+      }
+    }
+
 
     ssc.start()
     ssc.awaitTermination()
